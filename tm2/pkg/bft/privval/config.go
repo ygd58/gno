@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/gnolang/gno/tm2/pkg/bft/privval/signer/ledger"
 	"github.com/gnolang/gno/tm2/pkg/bft/privval/signer/local"
 	rsclient "github.com/gnolang/gno/tm2/pkg/bft/privval/signer/remote/client"
 	"github.com/gnolang/gno/tm2/pkg/bft/privval/upstream"
@@ -33,13 +34,21 @@ type PrivValidatorConfig struct {
 	// listens for tmkms / Horcrux to dial in). Mutually exclusive with RemoteSigner;
 	// see upstream_config.go.
 	TmkmsListener *TmkmsListenerConfig `json:"tmkms_listener" toml:"tmkms_listener" comment:"Configuration for upstream-Tendermint-protocol signer (tmkms / Horcrux). Empty listen_addr disables this mode."`
+
+	// Ledger configures a signer that delegates signing to a Ledger
+	// hardware wallet running the Tendermint Validator app. Unlike the
+	// other external-signer modes, the private key never leaves the
+	// device. Mutually exclusive with RemoteSigner and TmkmsListener.
+	Ledger *ledger.Config `json:"ledger" toml:"ledger" comment:"Configuration for signing with a Ledger hardware wallet"`
 }
 
 // PrivValidatorConfig validation errors.
 var (
-	errInvalidSignStatePath   = errors.New("invalid private validator sign state file path")
-	errInvalidLocalSignerPath = errors.New("invalid private validator local signer file path")
-	errNilRemoteSignerConfig  = errors.New("remote signer configuration cannot be nil")
+	errInvalidSignStatePath     = errors.New("invalid private validator sign state file path")
+	errInvalidLocalSignerPath   = errors.New("invalid private validator local signer file path")
+	errNilRemoteSignerConfig    = errors.New("remote signer configuration cannot be nil")
+	errNilLedgerConfig          = errors.New("ledger configuration cannot be nil")
+	errMultipleSignerSourcesSet = errors.New("only one of remote_signer, tmkms_listener, or ledger may be configured")
 )
 
 // DefaultPrivValidatorConfig returns a default configuration for the PrivValidator.
@@ -49,6 +58,7 @@ func DefaultPrivValidatorConfig() *PrivValidatorConfig {
 		LocalSigner:   "priv_validator_key.json",
 		RemoteSigner:  rsclient.DefaultRemoteSignerClientConfig(),
 		TmkmsListener: DefaultTmkmsListenerConfig(),
+		Ledger:        ledger.DefaultConfig(),
 	}
 }
 
@@ -97,9 +107,22 @@ func (cfg *PrivValidatorConfig) ValidateBasic() error {
 		}
 	}
 
+	// Verify the Ledger configuration is not nil.
+	if cfg.Ledger == nil {
+		return errNilLedgerConfig
+	}
+
+	// Validate the Ledger configuration.
+	if err := cfg.Ledger.ValidateBasic(); err != nil {
+		return err
+	}
+
 	// Mutual exclusion: at most one external-signer mode may be enabled.
 	if cfg.RemoteSigner.ServerAddress != "" && cfg.TmkmsListener.IsEnabled() {
 		return errBothExternalSignersEnabled
+	}
+	if cfg.Ledger.IsEnabled() && (cfg.RemoteSigner.ServerAddress != "" || cfg.TmkmsListener.IsEnabled()) {
+		return errMultipleSignerSourcesSet
 	}
 
 	return nil
@@ -123,6 +146,11 @@ func NewSignerFromConfig(
 			clientPrivKey,
 			clientLogger,
 		)
+	}
+
+	// If Ledger is enabled, delegate signing to the hardware device.
+	if config.Ledger.IsEnabled() {
+		return ledger.NewSignerFromConfig(config.Ledger)
 	}
 
 	// Otherwise, use a local signer.
@@ -149,9 +177,12 @@ func NewPrivValidatorFromConfig(
 ) (types.PrivValidator, error) {
 	// Mutual exclusion is also enforced in ValidateBasic, but defend in
 	// depth here in case callers skip validation.
-	if config.RemoteSigner != nil && config.RemoteSigner.ServerAddress != "" &&
-		config.TmkmsListener.IsEnabled() {
+	remoteSignerEnabled := config.RemoteSigner != nil && config.RemoteSigner.ServerAddress != ""
+	if remoteSignerEnabled && config.TmkmsListener.IsEnabled() {
 		return nil, errBothExternalSignersEnabled
+	}
+	if config.Ledger.IsEnabled() && (remoteSignerEnabled || config.TmkmsListener.IsEnabled()) {
+		return nil, errMultipleSignerSourcesSet
 	}
 
 	// tmkms-compat path. tmkms holds HRS authority; we don't wrap the
